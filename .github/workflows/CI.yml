@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: prereqs
+      run: |
+        set -eux
+        time sudo rm -rf /usr/local/lib/android
+        #sudo sed -i s/noble/oracular/ /etc/apt/sources.list
+        sudo apt update
+        sudo apt install -y ccache clang lld llvm # llvm-ar/-nm
+    - uses: actions/checkout@v4
+      with:
+         show-progress: false
+    - uses: Trass3r/setup-cpp@master
+    - uses: hendrikmuhs/ccache-action@v1
+      with:
+        max-size: 1G
+        verbose: 2
+    - name: build
+      env:
+        CCACHE_BASEDIR: ${{ github.workspace }}
+        CCACHE_NOCOMPRESS: 1 # cache action will also compress
+        #CCACHE_MAXFILES: 8000
+        CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_ctime,include_file_mtime
+        #CCACHE_COMPILERCHECK: '%compiler% -dumpversion'
+        CCACHE_DEBUG: 1
+        CCACHE_DEBUGLEVEL: 1 # only logs
+        CCACHE_LOGFILE: ccache.log
+      run: |
+        set -eux
+        cp arch/x86/configs/config-wsl .config
+        ./scripts/config -d XFS_FS -d NFS_FS -d NFSD -d BTRFS_FS -d F2FS_FS -d UFS_FS -d CRAMFS
+        ./scripts/config -d SUNRPC -d X86_X32 -d X86_16BIT -e CPU_FREQ -e CPU_FREQ_STAT -e CPU_FREQ_GOV_USERSPACE -e CPU_FREQ_GOV_ONDEMAND -e X86_INTEL_PSTATE -e SCHED_MC_PRIO -e PROFILING -e PERF_EVENTS_INTEL_UNCORE -e PERF_EVENTS_INTEL_RAPL -e PERF_EVENTS_INTEL_CSTATE -e ENERGY_MODEL -e INTEL_IDLE -e MODULE_COMPRESS_LZ4 -e KERNEL_LZ4 -e BPF_JIT -e OPROFILE -e OPROFILE_EVENT_MULTIPLEX
+        ./scripts/config -d CPU_MITIGATIONS -d SPECULATION_MITIGATIONS -d NETFILTER
+        # disable drivers not needed in WSL, MD is RAID, WLAN is obsolete
+        ./scripts/config -d DRM -d I2C -d MEDIA_SUPPORT -d MMC -d IIO -d ACCESSIBILITY -d INFINIBAND -d CAN -d BT -d INTEL_MEI -d MD -d WLAN
+        ./scripts/config -d NET_VENDOR_AGERE -d NET_VENDOR_ALACRITECH -d NET_VENDOR_ALTEON -d NET_VENDOR_AMD -d NET_VENDOR_ASIX -d NET_VENDOR_ATHEROS -d NET_VENDOR_BROADCOM -d NET_VENDOR_CADENCE -d NET_VENDOR_CAVIUM -d NET_VENDOR_CHELSIO -d NET_VENDOR_CISCO -d NET_VENDOR_DAVICOM -d NET_VENDOR_DEC -d NET_VENDOR_DLINK -d NET_VENDOR_EMULEX -d NET_VENDOR_ENGLEDER -d NET_VENDOR_EZCHIP -d NET_VENDOR_FUNGIBLE -d NET_VENDOR_GOOGLE -d NET_VENDOR_I825XX -d NET_VENDOR_LITEX -d NET_VENDOR_MARVELL -d NET_VENDOR_MELLANOX -d NET_VENDOR_MICROCHIP -d NET_VENDOR_MICROSOFT -d NET_VENDOR_MYRI -d NET_VENDOR_NVIDIA -d NET_VENDOR_PENSANDO -d NET_VENDOR_QLOGIC -d NET_VENDOR_BROCADE -d NET_VENDOR_QUALCOMM -d NET_VENDOR_REALTEK -d NET_VENDOR_RENESAS -d NET_VENDOR_ROCKER -d NET_VENDOR_SAMSUNG -d NET_VENDOR_VERTEXCOM -d NET_VENDOR_WANGXUN -d NET_VENDOR_XILINX
+        ./scripts/config -d USB_STORAGE -d ATA_SFF -d ATA -d SCSI -d ETHERNET
+
+        # /sys/kernel/debug/tracing not available without this
+        ./scripts/config -d SECURITY_LOCKDOWN_LSM
+
+        # USB support
+        ./scripts/config -m HID -m USB_HID -m USB -d USB_NET_DRIVERS -e USB_SUPPORT -e USB_ANNOUNCE_NEW_DEVICES -m USB_ACM -m USB_SERIAL -m USB_SERIAL_FTDI_SIO -m USBIP_CORE -m USBIP_VHCI_HCD -e USBIP_DEBUG
+
+        # codegen
+        ./scripts/config -e CC_OPTIMIZE_FOR_PERFORMANCE_O3 -e LTO_CLANG_THIN -d CFI_CLANG -d STACKPROTECTOR -e LD_DEAD_CODE_DATA_ELIMINATION -e VMLINUX_MAP
+        ./scripts/config -d RANDSTRUCT -d MODVERSIONS -e TRIM_UNUSED_KSYMS # don't use when building out-of-tree modules
+        ./scripts/config -d DEBUG_INFO_BTF # REDUCED is just -fno-var-tracking, NONE does not work if others are still enabled
+
+        # for tracy sampling
+        ./scripts/config -e DEBUG_FS -e PERF_EVENTS -e FTRACE  -e FUNCTION_TRACER -e FTRACE_SYSCALLS
+
+        # LTTNG support
+        ./scripts/config -e KALLSYMS -e HIGH_RES_TIMERS -e FTRACE -e KPROBES -m LTTNG -e MODULES
+        ./scripts/config -d WERROR -d KVM
+        # -e KALLSYMS_ALL for probe 'writeback'
+        # KPROBES requires MODULES
+        # for BCC: -e IKHEADERS
+
+        # build config
+        sudo apt install -y libelf-dev # elf for objtool
+        export LLVM=1 LLVM_IAS=1 KCFLAGS='-march=skylake -g1'
+        export KBUILD_BUILD_TIMESTAMP='' KBUILD_BUILD_USER=user KBUILD_BUILD_HOST=host KBUILD_BUILD_VERSION=0 # for ccache to work
+        make -j$(nproc) olddefconfig # or menuconfig
+        diff --color=always arch/x86/configs/config-wsl .config || true
+
+        # build kernel
+        ccache -z
+        time make V=2 CC="ccache clang" -j$(($(nproc) + 1)) bzImage  # V=1 for tracing
+        time make CC="ccache clang" -j$(($(nproc) + 1))
+        sudo make modules_install
+        sudo depmod -a
+
+        # build perf
+        sudo apt install -y libzstd-dev libelf-dev libbabeltrace-ctf-dev libdw-dev libtraceevent-dev libpfm4-dev libdebuginfod-dev
+        time make CC="ccache clang" NO_LIBCRYPTO=1 -j$(nproc) -C tools/perf install DESTDIR=/tmp/perf
+        # with DESTDIR=/usr/local always recompiles and makes build files owned by root
+        ccache -svv
+    - name: analyze ccache logs
+      run: |
+        find -name '*.ccache-log' | xargs grep -Ei 'preprocessed_cache_miss| supported|found |failed |unknown |too hard|Result: [^cdlp]' || true
+    - uses: actions/upload-artifact@v4
+      with:
+        name: kernel
+        path: |
+          arch/x86/boot/bzImage
+          vmlinux.map
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ccache-logs
+        path: |
+          ccache.log
+          **/*.ccache-log
+          **/*.ccache-input-text
+    - uses: actions/upload-artifact@v4
+      with:
+        name: perf
+        path: |
+          /tmp/perf/*
+    - uses: actions/upload-artifact@v4
+      with:
+        name: modules
+        path: |
+          /lib/modules/6.8.*
+          !/lib/modules/6.8.*/build
