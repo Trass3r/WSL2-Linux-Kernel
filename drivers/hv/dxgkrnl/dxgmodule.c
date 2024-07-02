@@ -15,6 +15,7 @@
 #include <linux/eventfd.h>
 #include <linux/hyperv.h>
 #include <linux/pci.h>
+#include <linux/version.h>
 #include "dxgkrnl.h"
 #include "dxgsyncfile.h"
 
@@ -175,7 +176,11 @@ void signal_host_cpu_event(struct dxghostevent *eventhdr)
 	}
 	if (event->cpu_event) {
 		DXG_TRACE("signal cpu event");
-		eventfd_signal(event->cpu_event, 1);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,8,0)
+                eventfd_signal(event->cpu_event);
+#else
+                eventfd_signal(event->cpu_event, 1);
+#endif
 		if (event->destroy_after_signal)
 			eventfd_ctx_put(event->cpu_event);
 	} else {
